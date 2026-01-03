@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+
+    <!-- Иконка для самого exe (опционально) -->
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Slions.VirtualDesktop" Version="6.9.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Чтобы иконка была внутри single-file -->
+    <EmbeddedResource Include="icon.ico" />
+  </ItemGroup>
+
+</Project>
