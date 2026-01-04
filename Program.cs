@@ -1,9 +1,15 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 using WindowsDesktop; // Slions.VirtualDesktop
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
 
 internal static class Program
 {
@@ -15,10 +21,9 @@ internal static class Program
     private const uint MOD_WIN = 0x0008;
     private const uint MOD_NOREPEAT = 0x4000;
 
-    private const int MoveHotkeyOffset = 100;
     private const uint GA_ROOT = 2;
     private const string TrayWindowClass = "Shell_TrayWnd";
-    private const uint ATTACH_INPUT = 0x0001;
+    private const string ConfigFileName = "wdhotkeys.yaml";
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -76,63 +81,60 @@ internal static class Program
     [STAThread]
     static void Main()
     {
+        using var mutex = new Mutex(true, "Global\\wdhotkeys-single-instance", out bool createdNew);
+        if (!createdNew)
+            return;
+
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
         var icon = LoadEmbeddedIcon("icon.ico") ?? SystemIcons.Application;
 
         using var hotkeyWindow = new HotkeyWindow();
-        using var tray = CreateTrayIcon(icon);
+        using var hotkeys = new HotkeyManager(hotkeyWindow.Handle);
+        using var tray = CreateTrayIcon(
+            icon,
+            reloadConfig: () => hotkeys.Reload(LoadConfig()),
+            openConfig: OpenConfigFile);
 
-        // Hotkeys: Ctrl+Alt+Win+1..9 (switch), Shift+Ctrl+Alt+Win+1..9 (move active window)
-        uint switchMods = MOD_CONTROL | MOD_ALT | MOD_WIN | MOD_NOREPEAT;
-        uint moveMods = MOD_SHIFT | MOD_CONTROL | MOD_ALT | MOD_WIN | MOD_NOREPEAT;
-        for (int i = 1; i <= 9; i++)
-        {
-            uint vk = (uint)('0' + i);
-            RegisterHotKey(hotkeyWindow.Handle, i, switchMods, vk);
-            RegisterHotKey(hotkeyWindow.Handle, MoveHotkeyOffset + i, moveMods, vk);
-        }
+        EnsureConfigFileExists();
+        hotkeys.Reload(LoadConfig());
 
-        Application.ApplicationExit += (_, _) =>
-        {
-            for (int i = 1; i <= 9; i++)
-            {
-                UnregisterHotKey(hotkeyWindow.Handle, i);
-                UnregisterHotKey(hotkeyWindow.Handle, MoveHotkeyOffset + i);
-            }
-        };
-
-        // Handle WM_HOTKEY from the hidden window
         hotkeyWindow.HotkeyPressed += id =>
         {
-            var desktops = VirtualDesktop.GetDesktops();
-            if (id is >= 1 and <= 9)
-            {
-                int index = id - 1;
-                if (index >= 0 && index < desktops.Length)
-                    desktops[index].Switch();
+            if (!hotkeys.TryGetAction(id, out var action))
                 return;
-            }
 
-            if (id >= MoveHotkeyOffset + 1 && id <= MoveHotkeyOffset + 9)
+            var desktops = VirtualDesktop.GetDesktops();
+            int targetIdx = action.Desktop - 1;
+            if (targetIdx < 0 || targetIdx >= desktops.Length)
+                return;
+
+            if (action.Kind == HotkeyActionKind.Switch)
             {
-                int index = id - MoveHotkeyOffset - 1;
-                if (index < 0 || index >= desktops.Length)
-                    return;
-
-                if (TryMoveForegroundWindow(desktops[index]))
-                    desktops[index].Switch();
+                desktops[targetIdx].Switch();
+            }
+            else if (action.Kind == HotkeyActionKind.Move)
+            {
+                if (TryMoveForegroundWindow(desktops[targetIdx]))
+                    desktops[targetIdx].Switch();
             }
         };
 
-        // ????????? WinForms message pump (??? ? ????? ??????????? ????)
         Application.Run();
     }
 
-    private static NotifyIcon CreateTrayIcon(Icon icon)
+    private static NotifyIcon CreateTrayIcon(Icon icon, Action reloadConfig, Action openConfig)
     {
         var menu = new ContextMenuStrip();
+
+        var openItem = new ToolStripMenuItem("Open config");
+        openItem.Click += (_, _) => openConfig();
+        menu.Items.Add(openItem);
+
+        var reloadItem = new ToolStripMenuItem("Reload config");
+        reloadItem.Click += (_, _) => reloadConfig();
+        menu.Items.Add(reloadItem);
 
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => Application.Exit();
@@ -146,10 +148,86 @@ internal static class Program
             ContextMenuStrip = menu
         };
 
-        // ??????? ?????? "??????? ???? = ?????"
-        // (?????? ?? ??????????? ?? DoubleClick)
-
         return tray;
+    }
+
+    private static ConfigModel LoadConfig()
+    {
+        try
+        {
+            var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ConfigFileName);
+            if (!File.Exists(path))
+                return DefaultConfig();
+
+            var yaml = File.ReadAllText(path);
+            var deserializer = new DeserializerBuilder()
+                .WithNamingConvention(CamelCaseNamingConvention.Instance)
+                .Build();
+
+            var model = deserializer.Deserialize<ConfigModel?>(yaml);
+            return model is null || model.Desktops.Count == 0 ? DefaultConfig() : model;
+        }
+        catch
+        {
+            return DefaultConfig();
+        }
+    }
+
+    private static ConfigModel DefaultConfig()
+    {
+        var desktops = new List<DesktopHotkeys>();
+        for (int i = 1; i <= 9; i++)
+        {
+            desktops.Add(new DesktopHotkeys
+            {
+                Desktop = i,
+                Switch = new List<string> { $"Ctrl+Alt+Win+{i}" },
+                Move = new List<string> { $"Shift+Ctrl+Alt+Win+{i}" }
+            });
+        }
+
+        return new ConfigModel { Desktops = desktops };
+    }
+
+    private static void EnsureConfigFileExists()
+    {
+        var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ConfigFileName);
+        if (File.Exists(path))
+            return;
+
+        try
+        {
+            var serializer = new SerializerBuilder()
+                .WithNamingConvention(CamelCaseNamingConvention.Instance)
+                .Build();
+
+            var yaml = serializer.Serialize(DefaultConfig());
+            Directory.CreateDirectory(Path.GetDirectoryName(path) ?? AppDomain.CurrentDomain.BaseDirectory);
+            File.WriteAllText(path, yaml);
+        }
+        catch
+        {
+            // Ignore I/O errors; app will fall back to defaults in-memory.
+        }
+    }
+
+    private static void OpenConfigFile()
+    {
+        EnsureConfigFileExists();
+        try
+        {
+            var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ConfigFileName);
+            var psi = new ProcessStartInfo
+            {
+                FileName = path,
+                UseShellExecute = true
+            };
+            Process.Start(psi);
+        }
+        catch
+        {
+            // ignore failures to launch editor
+        }
     }
 
     private static bool TryMoveForegroundWindow(VirtualDesktop targetDesktop)
@@ -253,7 +331,7 @@ internal static class Program
 
     private static Icon? LoadEmbeddedIcon(string fileName)
     {
-        // ???? ??????, ??????????????? ?? ".icon.ico" ??? "icon.ico"
+        // ищем ресурс, инкапсулированный как ".icon.ico" или "icon.ico"
         var asm = Assembly.GetExecutingAssembly();
         var resName = Array.Find(asm.GetManifestResourceNames(),
             n => n.EndsWith("." + fileName, StringComparison.OrdinalIgnoreCase) ||
@@ -267,13 +345,144 @@ internal static class Program
         return new Icon(stream);
     }
 
+    private sealed class HotkeyManager : IDisposable
+    {
+        private readonly IntPtr _windowHandle;
+        private readonly Dictionary<int, HotkeyAction> _actions = new();
+        private int _nextId = 1;
+
+        public HotkeyManager(IntPtr windowHandle)
+        {
+            _windowHandle = windowHandle;
+        }
+
+        public void Reload(ConfigModel config)
+        {
+            UnregisterAll();
+            _nextId = 1;
+
+            foreach (var desktop in config.Desktops)
+            {
+                Register(desktop.Desktop, HotkeyActionKind.Switch, desktop.Switch);
+                Register(desktop.Desktop, HotkeyActionKind.Move, desktop.Move);
+            }
+        }
+
+        public bool TryGetAction(int id, out HotkeyAction action) => _actions.TryGetValue(id, out action);
+
+        private void Register(int desktop, HotkeyActionKind kind, List<string> hotkeys)
+        {
+            foreach (var hotkey in hotkeys)
+            {
+                if (!TryParseHotkey(hotkey, out var mods, out var vk))
+                    continue;
+
+                int id = _nextId++;
+                if (RegisterHotKey(_windowHandle, id, mods, vk))
+                {
+                    _actions[id] = new HotkeyAction(kind, desktop);
+                }
+            }
+        }
+
+        private void UnregisterAll()
+        {
+            foreach (var id in _actions.Keys)
+                UnregisterHotKey(_windowHandle, id);
+            _actions.Clear();
+        }
+
+        public void Dispose()
+        {
+            UnregisterAll();
+        }
+    }
+
+    private enum HotkeyActionKind
+    {
+        Switch,
+        Move
+    }
+
+    private readonly record struct HotkeyAction(HotkeyActionKind Kind, int Desktop);
+
+    private static bool TryParseHotkey(string hotkey, out uint modifiers, out uint vk)
+    {
+        modifiers = 0;
+        vk = 0;
+
+        var parts = hotkey.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0)
+            return false;
+
+        bool keySet = false;
+        foreach (var part in parts)
+        {
+            var token = part.ToUpperInvariant();
+            switch (token)
+            {
+                case "CTRL":
+                case "CONTROL":
+                    modifiers |= MOD_CONTROL;
+                    break;
+                case "ALT":
+                    modifiers |= MOD_ALT;
+                    break;
+                case "SHIFT":
+                    modifiers |= MOD_SHIFT;
+                    break;
+                case "WIN":
+                case "META":
+                    modifiers |= MOD_WIN;
+                    break;
+                default:
+                    if (keySet)
+                        return false;
+
+                    if (token.Length == 1 && char.IsLetterOrDigit(token[0]))
+                    {
+                        vk = (uint)char.ToUpperInvariant(token[0]);
+                        keySet = true;
+                        break;
+                    }
+
+                    if (token.StartsWith("F", StringComparison.OrdinalIgnoreCase) &&
+                        int.TryParse(token.AsSpan(1), out int fn) && fn is >= 1 and <= 24)
+                    {
+                        vk = (uint)(Keys.F1 + fn - 1);
+                        keySet = true;
+                        break;
+                    }
+
+                    return false;
+            }
+        }
+
+        if (!keySet)
+            return false;
+
+        modifiers |= MOD_NOREPEAT;
+        return true;
+    }
+
+    private sealed class ConfigModel
+    {
+        public List<DesktopHotkeys> Desktops { get; set; } = new();
+    }
+
+    private sealed class DesktopHotkeys
+    {
+        public int Desktop { get; set; }
+        public List<string> Switch { get; set; } = new();
+        public List<string> Move { get; set; } = new();
+    }
+
     private sealed class HotkeyWindow : NativeWindow, IDisposable
     {
         public event Action<int>? HotkeyPressed;
 
         public HotkeyWindow()
         {
-            // ??????? ????????? ????, ?? ??????? ????? ????????? WM_HOTKEY
             CreateHandle(new CreateParams
             {
                 Caption = "wdhotkeys-hotkey-window",

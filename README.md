@@ -1,60 +1,44 @@
 # wdhotkeys
 
-`wdhotkeys` — это небольшая утилита для Windows, которая позволяет **мгновенно переключаться между виртуальными рабочими столами по горячим клавишам**.  
-Программа работает **в фоне**, не показывает консольное окно и живёт в **system tray** (области уведомлений).
+`wdhotkeys` is a small Windows utility to switch between virtual desktops and move windows across them. It runs in the background and lives in the system tray.
 
----
+## Features
+- Default shortcuts:  
+  - `Ctrl + Alt + Win + 1..9` — switch to desktop 1..9  
+  - `Shift + Ctrl + Alt + Win + 1..9` — move the active window to desktop 1..9 (and follow it)
+- Uses Windows 10/11 Virtual Desktops
+- Tray menu: Reload config, Open config, Exit
+- Auto-creates `wdhotkeys.yaml` on first run
+- Single-instance guard (won’t start a second copy)
+- Can be published as single-file exe
 
-## Возможности
+## How it works
+It uses **Slions.VirtualDesktop** to talk to the Windows virtual desktops API. Hotkeys are registered via `RegisterHotKey`, and actions are driven by the YAML config.
 
-- 🔀 Переключение на рабочие столы **по номеру** (без прокликивания влево/вправо)
-- ⌨️ Горячие клавиши:  
-  **Ctrl + Alt + Win + 1..9 → рабочий стол 1..9**
-- 🧠 Использует системные Virtual Desktops (Windows 10 / 11)
-- 🧩 Работает в фоне, без консольного окна
-- 📌 Иконка в трее с пунктом **Exit**
-- 📦 Один `exe` файл (single-file publish)
+## Config (YAML)
+Place `wdhotkeys.yaml` next to the exe (or next to the project when running from IDE). Each desktop can have multiple hotkeys for switching and moving.
 
----
+```yaml
+desktops:
+  - desktop: 1
+    switch: ["Ctrl+Alt+Win+1"]
+    move:   ["Shift+Ctrl+Alt+Win+1"]
+  - desktop: 2
+    switch: ["Ctrl+Alt+Win+2"]
+    move:   ["Shift+Ctrl+Alt+Win+2"]
+```
 
-## Как это работает
+- If the file is missing, it’s created with defaults. If it’s invalid, in-memory defaults are used.
+- After editing, click **Reload config** in the tray. **Open config** opens the file with the default editor.
 
-Внутри используется библиотека **Slions.VirtualDesktop**, которая корректно работает с актуальными версиями Windows 10 / 11 и оборачивает внутренние API виртуальных рабочих столов.
-
-Горячие клавиши регистрируются через `RegisterHotKey`, а переключение выполняется напрямую на нужный desktop по индексу.
-
----
-
-## Горячие клавиши
-
-| Комбинация | Действие |
-|-----------|----------|
-| Ctrl + Alt + Win + 1 | Перейти на рабочий стол 1 |
-| Ctrl + Alt + Win + 2 | Перейти на рабочий стол 2 |
-| … | … |
-| Ctrl + Alt + Win + 9 | Перейти на рабочий стол 9 |
-
-⚠️ Если комбинация не регистрируется, значит она уже занята системой или другим приложением.  
-В этом случае Windows просто не отдаст хоткей.
-
----
-
-## Сборка
-
-### Требования
-
+## Requirements
 - Windows 10 / 11
-- .NET SDK **8.0+**
-- x64 система
+- .NET SDK 8.0+
+- x64
 
-### Сборка single-file exe
-
+### Build single-file exe
 ```powershell
 dotnet publish -c Release -r win-x64 `
   /p:PublishSingleFile=true `
   /p:SelfContained=true
-
-### Hotkeys
-
-- Ctrl + Alt + Win + 1..9 - switch to desktop 1..9
-- Shift + Ctrl + Alt + Win + 1..9 - move the active window to desktop 1..9 (and switch to it)
+```
