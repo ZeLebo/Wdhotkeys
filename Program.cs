@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Drawing;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -11,14 +11,67 @@ internal static class Program
 
     private const uint MOD_ALT = 0x0001;
     private const uint MOD_CONTROL = 0x0002;
+    private const uint MOD_SHIFT = 0x0004;
     private const uint MOD_WIN = 0x0008;
     private const uint MOD_NOREPEAT = 0x4000;
+
+    private const int MoveHotkeyOffset = 100;
+    private const uint GA_ROOT = 2;
+    private const string TrayWindowClass = "Shell_TrayWnd";
+    private const uint ATTACH_INPUT = 0x0001;
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetShellWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetActiveWindow();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetFocus();
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GUITHREADINFO
+    {
+        public int cbSize;
+        public int flags;
+        public IntPtr hwndActive;
+        public IntPtr hwndFocus;
+        public IntPtr hwndCapture;
+        public IntPtr hwndMenuOwner;
+        public IntPtr hwndMoveSize;
+        public IntPtr hwndCaret;
+        public Rectangle rcCaret;
+    }
 
     [STAThread]
     static void Main()
@@ -31,34 +84,49 @@ internal static class Program
         using var hotkeyWindow = new HotkeyWindow();
         using var tray = CreateTrayIcon(icon);
 
-        // Хоткеи: Ctrl+Alt+Win+1..9
-        uint mods = MOD_CONTROL | MOD_ALT | MOD_WIN | MOD_NOREPEAT;
+        // Hotkeys: Ctrl+Alt+Win+1..9 (switch), Shift+Ctrl+Alt+Win+1..9 (move active window)
+        uint switchMods = MOD_CONTROL | MOD_ALT | MOD_WIN | MOD_NOREPEAT;
+        uint moveMods = MOD_SHIFT | MOD_CONTROL | MOD_ALT | MOD_WIN | MOD_NOREPEAT;
         for (int i = 1; i <= 9; i++)
         {
             uint vk = (uint)('0' + i);
-            if (!RegisterHotKey(hotkeyWindow.Handle, i, mods, vk))
-            {
-                // если нужно — можно писать в файл/ивентлог
-                // int err = Marshal.GetLastWin32Error();
-            }
+            RegisterHotKey(hotkeyWindow.Handle, i, switchMods, vk);
+            RegisterHotKey(hotkeyWindow.Handle, MoveHotkeyOffset + i, moveMods, vk);
         }
 
         Application.ApplicationExit += (_, _) =>
         {
             for (int i = 1; i <= 9; i++)
+            {
                 UnregisterHotKey(hotkeyWindow.Handle, i);
+                UnregisterHotKey(hotkeyWindow.Handle, MoveHotkeyOffset + i);
+            }
         };
 
-        // Обработка WM_HOTKEY
+        // Handle WM_HOTKEY from the hidden window
         hotkeyWindow.HotkeyPressed += id =>
         {
-            int index = id - 1;
             var desktops = VirtualDesktop.GetDesktops();
-            if (index >= 0 && index < desktops.Length)
-                desktops[index].Switch();
+            if (id is >= 1 and <= 9)
+            {
+                int index = id - 1;
+                if (index >= 0 && index < desktops.Length)
+                    desktops[index].Switch();
+                return;
+            }
+
+            if (id >= MoveHotkeyOffset + 1 && id <= MoveHotkeyOffset + 9)
+            {
+                int index = id - MoveHotkeyOffset - 1;
+                if (index < 0 || index >= desktops.Length)
+                    return;
+
+                if (TryMoveForegroundWindow(desktops[index]))
+                    desktops[index].Switch();
+            }
         };
 
-        // Запускаем WinForms message pump (это и чинит контекстное меню)
+        // ????????? WinForms message pump (??? ? ????? ??????????? ????)
         Application.Run();
     }
 
@@ -72,21 +140,120 @@ internal static class Program
 
         var tray = new NotifyIcon
         {
-            Text = "wdhotkeys (Ctrl+Alt+Win+1..9)",
+            Text = "wdhotkeys (Ctrl+Alt+Win+1..9 switch, Shift+Ctrl+Alt+Win+1..9 move)",
             Icon = icon,
             Visible = true,
             ContextMenuStrip = menu
         };
 
-        // Убираем логику “двойной клик = выход”
-        // (ничего не подписываем на DoubleClick)
+        // ??????? ?????? "??????? ???? = ?????"
+        // (?????? ?? ??????????? ?? DoubleClick)
 
         return tray;
     }
 
+    private static bool TryMoveForegroundWindow(VirtualDesktop targetDesktop)
+    {
+        var hWnd = GetActiveTopLevelWindow();
+        if (hWnd == IntPtr.Zero)
+            return false;
+
+        try
+        {
+            VirtualDesktop.MoveToDesktop(hWnd, targetDesktop);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Try to get a real user window (not the shell/tray/child window) even while a hotkey is pressed.
+    private static IntPtr GetActiveTopLevelWindow()
+    {
+        var shell = GetShellWindow();
+        var tray = FindWindow(TrayWindowClass, null);
+
+        IntPtr Normalize(IntPtr handle) => handle == IntPtr.Zero ? IntPtr.Zero : GetAncestor(handle, GA_ROOT);
+        bool IsUsable(IntPtr handle) =>
+            handle != IntPtr.Zero &&
+            handle != shell &&
+            handle != tray &&
+            IsWindowVisible(handle);
+
+        IntPtr PickFromThread(uint threadId)
+        {
+            if (threadId == 0)
+                return IntPtr.Zero;
+
+            uint current = GetCurrentThreadId();
+            bool attached = false;
+            try
+            {
+                if (current != threadId)
+                {
+                    attached = AttachThreadInput(current, threadId, true);
+                }
+
+                IntPtr[] threadCandidates =
+                {
+                    Normalize(GetActiveWindow()),
+                    Normalize(GetFocus()),
+                };
+
+                foreach (var c in threadCandidates)
+                {
+                    if (IsUsable(c))
+                        return c;
+                }
+            }
+            finally
+            {
+                if (attached)
+                    AttachThreadInput(current, threadId, false);
+            }
+
+            return IntPtr.Zero;
+        }
+
+        var fg = Normalize(GetForegroundWindow());
+        if (IsUsable(fg))
+            return fg;
+
+        // If foreground is shell/tray, try the GUI thread info of that thread.
+        uint tid = GetWindowThreadProcessId(GetForegroundWindow(), out _);
+        if (tid != 0)
+        {
+            var info = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
+            if (GetGUIThreadInfo(tid, ref info))
+            {
+                IntPtr[] candidates =
+                {
+                    Normalize(info.hwndActive),
+                    Normalize(info.hwndFocus),
+                    Normalize(info.hwndCapture),
+                    Normalize(info.hwndCaret),
+                };
+
+                foreach (var candidate in candidates)
+                {
+                    if (IsUsable(candidate))
+                        return candidate;
+                }
+            }
+
+            var attached = PickFromThread(tid);
+            if (IsUsable(attached))
+                return attached;
+        }
+
+        return IntPtr.Zero;
+    }
+
     private static Icon? LoadEmbeddedIcon(string fileName)
     {
-        // Ищем ресурс, заканчивающийся на ".icon.ico" или "icon.ico"
+        // ???? ??????, ??????????????? ?? ".icon.ico" ??? "icon.ico"
         var asm = Assembly.GetExecutingAssembly();
         var resName = Array.Find(asm.GetManifestResourceNames(),
             n => n.EndsWith("." + fileName, StringComparison.OrdinalIgnoreCase) ||
@@ -106,7 +273,7 @@ internal static class Program
 
         public HotkeyWindow()
         {
-            // Создаём невидимое окно, на которое будут приходить WM_HOTKEY
+            // ??????? ????????? ????, ?? ??????? ????? ????????? WM_HOTKEY
             CreateHandle(new CreateParams
             {
                 Caption = "wdhotkeys-hotkey-window",

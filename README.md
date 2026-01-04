@@ -53,3 +53,8 @@
 dotnet publish -c Release -r win-x64 `
   /p:PublishSingleFile=true `
   /p:SelfContained=true
+
+### Hotkeys
+
+- Ctrl + Alt + Win + 1..9 - switch to desktop 1..9
+- Shift + Ctrl + Alt + Win + 1..9 - move the active window to desktop 1..9 (and switch to it)
