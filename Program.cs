@@ -477,6 +477,7 @@ internal static class Program
             if (_hardMode && _hookBindings.Count > 0 && !EnsureHook())
             {
                 // Hook failed; fall back to safe mode for everything
+                Log("Hook failed, falling back to safe mode");
                 _hardMode = false;
                 _hookBindings.Clear();
                 UnregisterAll();
@@ -491,6 +492,8 @@ internal static class Program
             {
                 ReleaseHook();
             }
+
+            Log($"Reload: HardMode={_hardMode}, actions={_actions.Count}, hookBindings={_hookBindings.Count}, hookHandle={_hookHandle}");
         }
 
         public bool TryGetAction(int id, out HotkeyAction action) => _actions.TryGetValue(id, out action);
@@ -512,10 +515,12 @@ internal static class Program
                     {
                         _actions[_nextId] = new HotkeyAction(kind, desktop);
                         _nextId++;
+                        Log($"Registered via RegisterHotKey: {hotkey} -> desktop {desktop} ({kind})");
                     }
                     else
                     {
                         _hookBindings.Add(new HookBinding(new HotkeyAction(kind, desktop), hookMods, (int)vk));
+                        Log($"Registered via hook: {hotkey} -> desktop {desktop} ({kind})");
                     }
                 }
                 else
@@ -524,6 +529,7 @@ internal static class Program
                     if (RegisterHotKey(_windowHandle, id, mods, vk))
                     {
                         _actions[id] = new HotkeyAction(kind, desktop);
+                        Log($"Registered (safe): {hotkey} -> desktop {desktop} ({kind})");
                     }
                 }
             }
@@ -566,6 +572,11 @@ internal static class Program
             if (_hookHandle == IntPtr.Zero)
                 _hookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, IntPtr.Zero, 0);
 
+            if (_hookHandle != IntPtr.Zero)
+                Log("Hook installed");
+            else
+                Log("Hook install failed");
+
             return _hookHandle != IntPtr.Zero;
         }
 
@@ -593,8 +604,9 @@ internal static class Program
 
                     foreach (var binding in _hookBindings)
                     {
-                        if (binding.VirtualKey == vkCode && (currentMods & binding.Modifiers) == binding.Modifiers)
+                        if (binding.VirtualKey == vkCode && currentMods == binding.Modifiers)
                         {
+                            Log($"Hook matched: vk={vkCode}, mods={currentMods} -> {binding.Action.Kind} desktop {binding.Action.Desktop}");
                             Dispatch(binding.Action);
                             return (IntPtr)1; // suppress
                         }
