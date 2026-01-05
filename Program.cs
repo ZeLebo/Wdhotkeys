@@ -31,6 +31,8 @@ internal static class Program
     private const int WM_SYSKEYDOWN = 0x0104;
     private const int WM_KEYUP = 0x0101;
     private const int WM_SYSKEYUP = 0x0105;
+    private const int DWMWA_CLOAKED = 14;
+    private const int SW_RESTORE = 9;
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -49,6 +51,9 @@ internal static class Program
 
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr FindWindow(string lpClassName, string? lpWindowName);
@@ -89,7 +94,17 @@ internal static class Program
     [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
     private static extern IntPtr GetModuleHandle(string lpModuleName);
 
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
     private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct KBDLLHOOKSTRUCT
@@ -102,6 +117,7 @@ internal static class Program
     }
 
     private static readonly Dictionary<Guid, IntPtr> LastDesktopFocus = new();
+    private static IntPtr HotkeyWindowHandle = IntPtr.Zero;
     private static string LogPath => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wdhotkeys.log");
 
     [StructLayout(LayoutKind.Sequential)]
@@ -140,6 +156,7 @@ internal static class Program
         var icon = LoadEmbeddedIcon("icon.ico") ?? SystemIcons.Application;
 
         using var hotkeyWindow = new HotkeyWindow();
+        HotkeyWindowHandle = hotkeyWindow.Handle;
         using var hotkeys = new HotkeyManager(hotkeyWindow.Handle, uiContext, HandleHotkey);
         using var tray = CreateTrayIcon(
             icon,
@@ -173,7 +190,7 @@ internal static class Program
             {
                 TrySaveCurrentFocus();
                 desktops[targetIdx].Switch();
-                RestoreDesktopFocus(desktops[targetIdx]);
+                FocusAnyWindowOnCurrentDesktop(desktops[targetIdx]);
             }
             else if (action.Kind == HotkeyActionKind.Move)
             {
@@ -334,6 +351,83 @@ internal static class Program
             return;
 
         LastDesktopFocus[desktop.Id] = hWnd;
+    }
+
+    private static void FocusAnyWindowOnCurrentDesktop(VirtualDesktop desktop)
+    {
+        if (desktop is null)
+            return;
+
+        // Try saved handle first
+        if (LastDesktopFocus.TryGetValue(desktop.Id, out var saved) &&
+            saved != IntPtr.Zero &&
+            IsEligibleWindow(saved) &&
+            VirtualDesktop.IsCurrentVirtualDesktop(saved))
+        {
+            FocusWindow(saved);
+            return;
+        }
+
+        // Otherwise, pick the first visible window on the current desktop
+        IntPtr candidate = IntPtr.Zero;
+        EnumWindows((hwnd, _) =>
+        {
+            if (!IsEligibleWindow(hwnd))
+                return true;
+
+            if (!VirtualDesktop.IsCurrentVirtualDesktop(hwnd))
+                return true;
+
+            candidate = hwnd;
+            return false; // stop enumeration
+        }, IntPtr.Zero);
+
+        if (candidate != IntPtr.Zero)
+            FocusWindow(candidate);
+        else if (HotkeyWindowHandle != IntPtr.Zero)
+            FocusWindow(HotkeyWindowHandle);
+        else
+            FocusWindow(GetShellWindow());
+    }
+
+    private static bool IsEligibleWindow(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero)
+            return false;
+        if (hwnd == HotkeyWindowHandle)
+            return false;
+
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd))
+            return false;
+
+        // Skip cloaked (invisible) windows (e.g., background UWP)
+        if (DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out var cloaked, sizeof(int)) == 0 && cloaked != 0)
+            return false;
+
+        return true;
+    }
+
+    private static void FocusWindow(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero)
+            return;
+
+        uint targetThread = GetWindowThreadProcessId(hWnd, out _);
+        uint currentThread = GetCurrentThreadId();
+        bool attached = false;
+        try
+        {
+            if (targetThread != currentThread)
+                attached = AttachThreadInput(currentThread, targetThread, true);
+
+            ShowWindow(hWnd, SW_RESTORE);
+            SetForegroundWindow(hWnd);
+        }
+        finally
+        {
+            if (attached)
+                AttachThreadInput(currentThread, targetThread, false);
+        }
     }
 
     private static void TrySaveCurrentFocus()
