@@ -32,6 +32,7 @@ desktops:
 - If the file is missing, it’s created with defaults. If it’s invalid, in-memory defaults are used.
 - After editing, click **Reload config** in the tray. **Open config** opens the file with the default editor.
 - To enable aggressive capture of system shortcuts, add `hardMode: true` at the root of the YAML. This enables a low-level keyboard hook and will attempt to intercept shell shortcuts like Win+1..9. Leave it `false` (default) for safer behavior using `RegisterHotKey`.
+- Sometimes `hardMode` doesn't apply on simple `reload config`, need to restart the app itself
 
 ## Requirements
 - Windows 10 / 11
