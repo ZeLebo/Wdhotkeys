@@ -24,6 +24,13 @@ internal static class Program
     private const uint GA_ROOT = 2;
     private const string TrayWindowClass = "Shell_TrayWnd";
     private const string ConfigFileName = "wdhotkeys.yaml";
+    private const bool DefaultHardMode = false;
+
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WM_KEYDOWN = 0x0100;
+    private const int WM_SYSKEYDOWN = 0x0104;
+    private const int WM_KEYUP = 0x0101;
+    private const int WM_SYSKEYUP = 0x0105;
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -67,7 +74,35 @@ internal static class Program
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KBDLLHOOKSTRUCT
+    {
+        public int vkCode;
+        public int scanCode;
+        public int flags;
+        public int time;
+        public IntPtr dwExtraInfo;
+    }
+
     private static readonly Dictionary<Guid, IntPtr> LastDesktopFocus = new();
+    private static string LogPath => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wdhotkeys.log");
 
     [StructLayout(LayoutKind.Sequential)]
     private struct GUITHREADINFO
@@ -86,6 +121,12 @@ internal static class Program
     [STAThread]
     static void Main()
     {
+        try
+        {
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += (_, e) => Log($"ThreadException: {e.Exception}");
+            AppDomain.CurrentDomain.UnhandledException += (_, e) => Log($"UnhandledException: {e.ExceptionObject}");
+
         using var mutex = new Mutex(true, "Global\\wdhotkeys-single-instance", out bool createdNew);
         if (!createdNew)
             return;
@@ -93,10 +134,13 @@ internal static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
+        var uiContext = new WindowsFormsSynchronizationContext();
+        SynchronizationContext.SetSynchronizationContext(uiContext);
+
         var icon = LoadEmbeddedIcon("icon.ico") ?? SystemIcons.Application;
 
         using var hotkeyWindow = new HotkeyWindow();
-        using var hotkeys = new HotkeyManager(hotkeyWindow.Handle);
+        using var hotkeys = new HotkeyManager(hotkeyWindow.Handle, uiContext, HandleHotkey);
         using var tray = CreateTrayIcon(
             icon,
             reloadConfig: () => hotkeys.Reload(LoadConfig()),
@@ -105,34 +149,40 @@ internal static class Program
         EnsureConfigFileExists();
         hotkeys.Reload(LoadConfig());
 
-        hotkeyWindow.HotkeyPressed += id =>
-        {
-            if (!hotkeys.TryGetAction(id, out var action))
-                return;
-
-            var desktops = VirtualDesktop.GetDesktops();
-            int targetIdx = action.Desktop - 1;
-            if (targetIdx < 0 || targetIdx >= desktops.Length)
-                return;
-
-            if (action.Kind == HotkeyActionKind.Switch)
-            {
-                SaveCurrentDesktopFocus(VirtualDesktop.Current);
-                desktops[targetIdx].Switch();
-                RestoreDesktopFocus(desktops[targetIdx]);
-            }
-            else if (action.Kind == HotkeyActionKind.Move)
-            {
-                if (TryMoveForegroundWindow(desktops[targetIdx], out var movedWindow))
-                {
-                    desktops[targetIdx].Switch();
-                    if (movedWindow != IntPtr.Zero)
-                        SetForegroundWindow(movedWindow);
-                }
-            }
-        };
+        hotkeyWindow.HotkeyPressed += hotkeys.HandleRegisteredHotkey;
 
         Application.Run();
+    }
+        catch (Exception ex)
+        {
+            Log($"Fatal: {ex}");
+            MessageBox.Show($"wdhotkeys crashed:\n{ex.Message}", "wdhotkeys", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private static void HandleHotkey(HotkeyAction action)
+    {
+        var desktops = VirtualDesktop.GetDesktops();
+        int targetIdx = action.Desktop - 1;
+        if (targetIdx < 0 || targetIdx >= desktops.Length)
+            return;
+
+        if (action.Kind == HotkeyActionKind.Switch)
+        {
+            SaveCurrentDesktopFocus(VirtualDesktop.Current);
+            desktops[targetIdx].Switch();
+            RestoreDesktopFocus(desktops[targetIdx]);
+        }
+        else if (action.Kind == HotkeyActionKind.Move)
+        {
+            if (TryMoveForegroundWindow(desktops[targetIdx], out var movedWindow))
+            {
+                desktops[targetIdx].Switch();
+                if (movedWindow != IntPtr.Zero)
+                    SetForegroundWindow(movedWindow);
+            }
+        }
+        Log($"Handled {action.Kind} -> desktop {action.Desktop}");
     }
 
     private static NotifyIcon CreateTrayIcon(Icon icon, Action reloadConfig, Action openConfig)
@@ -168,7 +218,11 @@ internal static class Program
         {
             var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ConfigFileName);
             if (!File.Exists(path))
-                return DefaultConfig();
+            {
+                var def = DefaultConfig();
+                Log($"Config missing, using defaults. HardMode={def.HardMode}, desktops={def.Desktops.Count}");
+                return def;
+            }
 
             var yaml = File.ReadAllText(path);
             var deserializer = new DeserializerBuilder()
@@ -176,10 +230,13 @@ internal static class Program
                 .Build();
 
             var model = deserializer.Deserialize<ConfigModel?>(yaml);
-            return model is null || model.Desktops.Count == 0 ? DefaultConfig() : model;
+            var result = model is null || model.Desktops.Count == 0 ? DefaultConfig() : model;
+            Log($"Config loaded. HardMode={result.HardMode}, desktops={result.Desktops.Count}");
+            return result;
         }
-        catch
+        catch (Exception ex)
         {
+            Log($"LoadConfig failed: {ex}");
             return DefaultConfig();
         }
     }
@@ -187,7 +244,7 @@ internal static class Program
     private static ConfigModel DefaultConfig()
     {
         var desktops = new List<DesktopHotkeys>();
-        for (int i = 1; i <= 9; i++)
+        for (int i = 1; i <= 5; i++)
         {
             desktops.Add(new DesktopHotkeys
             {
@@ -388,27 +445,57 @@ internal static class Program
     private sealed class HotkeyManager : IDisposable
     {
         private readonly IntPtr _windowHandle;
+        private readonly SynchronizationContext _uiContext;
+        private readonly Action<HotkeyAction> _onHotkey;
         private readonly Dictionary<int, HotkeyAction> _actions = new();
+        private readonly List<HookBinding> _hookBindings = new();
+        private IntPtr _hookHandle = IntPtr.Zero;
+        private LowLevelKeyboardProc? _hookProc;
         private int _nextId = 1;
+        private bool _hardMode;
 
-        public HotkeyManager(IntPtr windowHandle)
+        public HotkeyManager(IntPtr windowHandle, SynchronizationContext uiContext, Action<HotkeyAction> onHotkey)
         {
             _windowHandle = windowHandle;
+            _uiContext = uiContext;
+            _onHotkey = onHotkey;
         }
 
         public void Reload(ConfigModel config)
         {
             UnregisterAll();
             _nextId = 1;
+            _hardMode = config.HardMode;
+            _hookBindings.Clear();
 
             foreach (var desktop in config.Desktops)
             {
                 Register(desktop.Desktop, HotkeyActionKind.Switch, desktop.Switch);
                 Register(desktop.Desktop, HotkeyActionKind.Move, desktop.Move);
             }
+
+            if (_hardMode && _hookBindings.Count > 0 && !EnsureHook())
+            {
+                // Hook failed; fall back to safe mode for everything
+                _hardMode = false;
+                _hookBindings.Clear();
+                UnregisterAll();
+                foreach (var desktop in config.Desktops)
+                {
+                    Register(desktop.Desktop, HotkeyActionKind.Switch, desktop.Switch);
+                    Register(desktop.Desktop, HotkeyActionKind.Move, desktop.Move);
+                }
+                ReleaseHook();
+            }
+            else if (!_hardMode || _hookBindings.Count == 0)
+            {
+                ReleaseHook();
+            }
         }
 
         public bool TryGetAction(int id, out HotkeyAction action) => _actions.TryGetValue(id, out action);
+
+        public void HandleRegisteredHotkey(int id) => DispatchIfKnown(id);
 
         private void Register(int desktop, HotkeyActionKind kind, List<string> hotkeys)
         {
@@ -417,10 +504,27 @@ internal static class Program
                 if (!TryParseHotkey(hotkey, out var mods, out var vk))
                     continue;
 
-                int id = _nextId++;
-                if (RegisterHotKey(_windowHandle, id, mods, vk))
+                if (_hardMode)
                 {
-                    _actions[id] = new HotkeyAction(kind, desktop);
+                    uint hookMods = mods & ~MOD_NOREPEAT; // low-level hook doesn't use MOD_NOREPEAT
+                    bool registered = RegisterHotKey(_windowHandle, _nextId, mods, vk);
+                    if (registered)
+                    {
+                        _actions[_nextId] = new HotkeyAction(kind, desktop);
+                        _nextId++;
+                    }
+                    else
+                    {
+                        _hookBindings.Add(new HookBinding(new HotkeyAction(kind, desktop), hookMods, (int)vk));
+                    }
+                }
+                else
+                {
+                    int id = _nextId++;
+                    if (RegisterHotKey(_windowHandle, id, mods, vk))
+                    {
+                        _actions[id] = new HotkeyAction(kind, desktop);
+                    }
                 }
             }
         }
@@ -430,11 +534,104 @@ internal static class Program
             foreach (var id in _actions.Keys)
                 UnregisterHotKey(_windowHandle, id);
             _actions.Clear();
+            _hookBindings.Clear();
         }
 
         public void Dispose()
         {
             UnregisterAll();
+            ReleaseHook();
+        }
+
+        private bool EnsureHook()
+        {
+            if (_hookHandle != IntPtr.Zero)
+                return true;
+
+            _hookProc = HookCallback;
+            IntPtr hModule = IntPtr.Zero;
+            try
+            {
+                using var curProcess = Process.GetCurrentProcess();
+                using var curModule = curProcess.MainModule;
+                if (curModule != null)
+                    hModule = GetModuleHandle(curModule.ModuleName);
+            }
+            catch
+            {
+                hModule = IntPtr.Zero;
+            }
+
+            _hookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, hModule, 0);
+            if (_hookHandle == IntPtr.Zero)
+                _hookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, IntPtr.Zero, 0);
+
+            return _hookHandle != IntPtr.Zero;
+        }
+
+        private void ReleaseHook()
+        {
+            if (_hookHandle != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_hookHandle);
+                _hookHandle = IntPtr.Zero;
+            }
+            _hookProc = null;
+        }
+
+        private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            try
+            {
+                bool isKeyDown = wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN;
+                if (nCode >= 0 && isKeyDown)
+                {
+                    var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+                    int vkCode = info.vkCode;
+
+                    uint currentMods = GetCurrentModifiersSnapshot();
+
+                    foreach (var binding in _hookBindings)
+                    {
+                        if (binding.VirtualKey == vkCode && (currentMods & binding.Modifiers) == binding.Modifiers)
+                        {
+                            Dispatch(binding.Action);
+                            return (IntPtr)1; // suppress
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // swallow to avoid crashing the hook
+            }
+
+            return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
+        }
+
+        private static uint GetCurrentModifiersSnapshot()
+        {
+            uint mods = 0;
+            if ((GetAsyncKeyState((int)Keys.ControlKey) & 0x8000) != 0)
+                mods |= MOD_CONTROL;
+            if ((GetAsyncKeyState((int)Keys.Menu) & 0x8000) != 0)
+                mods |= MOD_ALT;
+            if ((GetAsyncKeyState((int)Keys.ShiftKey) & 0x8000) != 0)
+                mods |= MOD_SHIFT;
+            if ((GetAsyncKeyState((int)Keys.LWin) & 0x8000) != 0 || (GetAsyncKeyState((int)Keys.RWin) & 0x8000) != 0)
+                mods |= MOD_WIN;
+            return mods;
+        }
+
+        private void DispatchIfKnown(int id)
+        {
+            if (TryGetAction(id, out var action))
+                Dispatch(action);
+        }
+
+        private void Dispatch(HotkeyAction action)
+        {
+            _uiContext.Post(_ => _onHotkey(action), null);
         }
     }
 
@@ -445,6 +642,8 @@ internal static class Program
     }
 
     private readonly record struct HotkeyAction(HotkeyActionKind Kind, int Desktop);
+
+    private sealed record HookBinding(HotkeyAction Action, uint Modifiers, int VirtualKey);
 
     private static bool TryParseHotkey(string hotkey, out uint modifiers, out uint vk)
     {
@@ -507,6 +706,7 @@ internal static class Program
 
     private sealed class ConfigModel
     {
+        public bool HardMode { get; set; } = DefaultHardMode;
         public List<DesktopHotkeys> Desktops { get; set; } = new();
     }
 
@@ -515,6 +715,19 @@ internal static class Program
         public int Desktop { get; set; }
         public List<string> Switch { get; set; } = new();
         public List<string> Move { get; set; } = new();
+    }
+
+    private static void Log(string message)
+    {
+        try
+        {
+            var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}";
+            File.AppendAllText(LogPath, line);
+        }
+        catch
+        {
+            // ignore logging failures
+        }
     }
 
     private sealed class HotkeyWindow : NativeWindow, IDisposable
