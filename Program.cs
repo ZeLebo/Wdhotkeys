@@ -162,27 +162,34 @@ internal static class Program
 
     private static void HandleHotkey(HotkeyAction action)
     {
-        var desktops = VirtualDesktop.GetDesktops();
-        int targetIdx = action.Desktop - 1;
-        if (targetIdx < 0 || targetIdx >= desktops.Length)
-            return;
+        try
+        {
+            var desktops = VirtualDesktop.GetDesktops();
+            int targetIdx = action.Desktop - 1;
+            if (targetIdx < 0 || targetIdx >= desktops.Length)
+                return;
 
-        if (action.Kind == HotkeyActionKind.Switch)
-        {
-            SaveCurrentDesktopFocus(VirtualDesktop.Current);
-            desktops[targetIdx].Switch();
-            RestoreDesktopFocus(desktops[targetIdx]);
-        }
-        else if (action.Kind == HotkeyActionKind.Move)
-        {
-            if (TryMoveForegroundWindow(desktops[targetIdx], out var movedWindow))
+            if (action.Kind == HotkeyActionKind.Switch)
             {
+                TrySaveCurrentFocus();
                 desktops[targetIdx].Switch();
-                if (movedWindow != IntPtr.Zero)
-                    SetForegroundWindow(movedWindow);
+                RestoreDesktopFocus(desktops[targetIdx]);
             }
+            else if (action.Kind == HotkeyActionKind.Move)
+            {
+                if (TryMoveForegroundWindow(desktops[targetIdx], out var movedWindow))
+                {
+                    desktops[targetIdx].Switch();
+                    if (movedWindow != IntPtr.Zero)
+                        SetForegroundWindow(movedWindow);
+                }
+            }
+            Log($"Handled {action.Kind} -> desktop {action.Desktop}");
         }
-        Log($"Handled {action.Kind} -> desktop {action.Desktop}");
+        catch (Exception ex)
+        {
+            Log($"HandleHotkey error: {ex}");
+        }
     }
 
     private static NotifyIcon CreateTrayIcon(Icon icon, Action reloadConfig, Action openConfig)
@@ -327,6 +334,18 @@ internal static class Program
             return;
 
         LastDesktopFocus[desktop.Id] = hWnd;
+    }
+
+    private static void TrySaveCurrentFocus()
+    {
+        try
+        {
+            SaveCurrentDesktopFocus(VirtualDesktop.Current);
+        }
+        catch (Exception ex)
+        {
+            Log($"Save focus failed: {ex}");
+        }
     }
 
     private static void RestoreDesktopFocus(VirtualDesktop desktop)
