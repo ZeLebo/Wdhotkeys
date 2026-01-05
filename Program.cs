@@ -64,6 +64,11 @@ internal static class Program
     [DllImport("user32.dll")]
     private static extern IntPtr GetFocus();
 
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    private static readonly Dictionary<Guid, IntPtr> LastDesktopFocus = new();
+
     [StructLayout(LayoutKind.Sequential)]
     private struct GUITHREADINFO
     {
@@ -112,12 +117,18 @@ internal static class Program
 
             if (action.Kind == HotkeyActionKind.Switch)
             {
+                SaveCurrentDesktopFocus(VirtualDesktop.Current);
                 desktops[targetIdx].Switch();
+                RestoreDesktopFocus(desktops[targetIdx]);
             }
             else if (action.Kind == HotkeyActionKind.Move)
             {
-                if (TryMoveForegroundWindow(desktops[targetIdx]))
+                if (TryMoveForegroundWindow(desktops[targetIdx], out var movedWindow))
+                {
                     desktops[targetIdx].Switch();
+                    if (movedWindow != IntPtr.Zero)
+                        SetForegroundWindow(movedWindow);
+                }
             }
         };
 
@@ -230,8 +241,9 @@ internal static class Program
         }
     }
 
-    private static bool TryMoveForegroundWindow(VirtualDesktop targetDesktop)
+    private static bool TryMoveForegroundWindow(VirtualDesktop targetDesktop, out IntPtr movedWindow)
     {
+        movedWindow = IntPtr.Zero;
         var hWnd = GetActiveTopLevelWindow();
         if (hWnd == IntPtr.Zero)
             return false;
@@ -239,12 +251,40 @@ internal static class Program
         try
         {
             VirtualDesktop.MoveToDesktop(hWnd, targetDesktop);
+            movedWindow = hWnd;
             return true;
         }
         catch
         {
             return false;
         }
+    }
+
+    private static void SaveCurrentDesktopFocus(VirtualDesktop? desktop)
+    {
+        if (desktop is null)
+            return;
+
+        var hWnd = GetActiveTopLevelWindow();
+        if (hWnd == IntPtr.Zero)
+            return;
+
+        LastDesktopFocus[desktop.Id] = hWnd;
+    }
+
+    private static void RestoreDesktopFocus(VirtualDesktop desktop)
+    {
+        if (!LastDesktopFocus.TryGetValue(desktop.Id, out var hWnd))
+            return;
+
+        if (hWnd == IntPtr.Zero || !IsWindowVisible(hWnd))
+            return;
+
+        // Ensure the window is on the current desktop before focusing.
+        if (!VirtualDesktop.IsCurrentVirtualDesktop(hWnd))
+            return;
+
+        SetForegroundWindow(hWnd);
     }
 
     // Try to get a real user window (not the shell/tray/child window) even while a hotkey is pressed.
